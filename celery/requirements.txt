@@ -1,0 +1,70 @@
+# Flask and web framework
+fastapi
+uvicorn[standard]
+python-multipart
+email-validator
+
+# Database
+SQLAlchemy
+psycopg2-binary
+pymongo
+redis
+
+# Authentication
+PyJWT
+Werkzeug
+
+# Task queue
+celery
+kombu
+
+# AI and ML - Updated compatible versions
+langchain
+langchain-openai
+langchain-community
+langchain-core
+langgraph
+langsmith
+openai
+
+# Vector databases
+faiss-cpu
+chromadb
+
+# Document processing
+PyPDF2
+pandas
+openpyxl
+beautifulsoup4
+lxml
+
+# HTTP requests
+requests
+
+# Cloud storage
+boto3
+
+# Logging
+structlog
+
+# Utilities
+python-dotenv
+validators
+
+# Monitoring
+prometheus-client
+
+# Development and testing
+pytest
+pytest-asyncio
+black
+flake8
+
+#embedding
+sentence-transformers
+torch
+transformers
+
+azure-ai-inference
+
+pika

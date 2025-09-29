@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: whatsapp-saas-config
+  namespace: whatsapp-saas
+data:
+  FLASK_ENV: "production"
+  POSTGRES_URL: "postgresql://whatsapp_user:whatsapp_pass@postgres-service:5432/whatsapp_saas"
+  REDIS_URL: "redis://redis-service:6379/0"
+  MONGODB_URL: "mongodb://mongodb-service:27017/whatsapp_saas"
+  CELERY_BROKER_URL: "pyamqp://guest@rabbitmq-service:5672//"
+  CELERY_RESULT_BACKEND: "redis://redis-service:6379/1"
+  CHROMADB_HOST: "chromadb-service"
+  CHROMADB_PORT: "8000"
+  VECTOR_DB_TYPE: "chromadb"
+  LANGCHAIN_TRACING_V2: "true"
+  LANGCHAIN_PROJECT: "whatsapp-ai-saas"
