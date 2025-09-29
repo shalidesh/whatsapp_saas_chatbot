@@ -1,0 +1,118 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: whatsapp-saas-app
+  namespace: whatsapp-saas
+  labels:
+    app: whatsapp-saas-app
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: whatsapp-saas-app
+  template:
+    metadata:
+      labels:
+        app: whatsapp-saas-app
+    spec:
+      containers:
+      - name: app
+        image: whatsapp-saas:latest
+        ports:
+        - containerPort: 5000
+        envFrom:
+        - configMapRef:
+            name: whatsapp-saas-config
+        - secretRef:
+            name: whatsapp-saas-secrets
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 5000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 5000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: whatsapp-saas-celery-worker
+  namespace: whatsapp-saas
+  labels:
+    app: whatsapp-saas-celery-worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: whatsapp-saas-celery-worker
+  template:
+    metadata:
+      labels:
+        app: whatsapp-saas-celery-worker
+    spec:
+      containers:
+      - name: celery-worker
+        image: whatsapp-saas:latest
+        command: ["celery"]
+        args: ["-A", "app.tasks.celery_app", "worker", "--loglevel=info", "--concurrency=4"]
+        envFrom:
+        - configMapRef:
+            name: whatsapp-saas-config
+        - secretRef:
+            name: whatsapp-saas-secrets
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: whatsapp-saas-celery-beat
+  namespace: whatsapp-saas
+  labels:
+    app: whatsapp-saas-celery-beat
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: whatsapp-saas-celery-beat
+  template:
+    metadata:
+      labels:
+        app: whatsapp-saas-celery-beat
+    spec:
+      containers:
+      - name: celery-beat
+        image: whatsapp-saas:latest
+        command: ["celery"]
+        args: ["-A", "app.tasks.celery_app", "beat", "--loglevel=info"]
+        envFrom:
+        - configMapRef:
+            name: whatsapp-saas-config
+        - secretRef:
+            name: whatsapp-saas-secrets
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "200m"
