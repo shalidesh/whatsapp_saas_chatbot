@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException, Depends, status, UploadFile, File,
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime, timedelta
-from sqlalchemy import func, desc
+from sqlalchemy import func, desc,case
 import structlog
 
 from ...models.user import User
@@ -225,6 +225,8 @@ async def get_analytics(
             Business.id == business_id,
             Business.user_id == current_user.id
         ).first()
+
+        print(business)
         
         if not business:
             raise HTTPException(
@@ -234,17 +236,29 @@ async def get_analytics(
         
         end_date = datetime.utcnow()
         start_date = end_date - timedelta(days=days)
-        
+
         # Daily message counts
         daily_stats = db_session.query(
             func.date(Message.created_at).label('date'),
             func.count(Message.id).label('total'),
-            func.sum(func.case([(Message.direction == MessageDirection.INBOUND, 1)], else_=0)).label('inbound'),
-            func.sum(func.case([(Message.direction == MessageDirection.OUTBOUND, 1)], else_=0)).label('outbound')
+            func.sum(
+                case(
+                    (Message.direction == MessageDirection.INBOUND, 1),
+                    else_=0
+                )
+            ).label('inbound'),
+            func.sum(
+                case(
+                    (Message.direction == MessageDirection.OUTBOUND, 1),
+                    else_=0
+                )
+            ).label('outbound')
         ).filter(
             Message.business_id == business_id,
             Message.created_at >= start_date
         ).group_by(func.date(Message.created_at)).all()
+
+        print(daily_stats)
         
         # Language distribution
         language_stats = db_session.query(
@@ -259,11 +273,12 @@ async def get_analytics(
         
         # Response time distribution
         response_time_stats = db_session.query(
-            func.case([
+            case(
                 (Message.processing_time_ms < 1000, 'Under 1s'),
                 (Message.processing_time_ms < 5000, '1-5s'),
                 (Message.processing_time_ms < 10000, '5-10s'),
-            ], else_='Over 10s').label('bucket'),
+                else_='Over 10s'
+            ).label('bucket'),
             func.count(Message.id).label('count')
         ).filter(
             Message.business_id == business_id,
