@@ -104,3 +104,5 @@ pytest.ini
 simple_persistence_test.py
 test_vector_persistence.py
 README2.md
+frontend/node_modules
+frontend/.next
