@@ -38,7 +38,7 @@ def create_app():
     # Add CORS middleware
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:3000", "https://yourdomain.com"],
+        allow_origins=["http://localhost:3000", "http://192.168.8.194:3000", "https://yourdomain.com"],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
