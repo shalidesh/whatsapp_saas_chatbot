@@ -40,6 +40,8 @@ lxml
 
 # HTTP requests
 requests
+httpx
+cachetools
 
 # Cloud storage
 boto3
@@ -66,5 +68,8 @@ flake8
 # transformers - No longer needed (using API)
 
 azure-ai-inference
-
 pika
+
+httpx          # Async HTTP client for fetching sheets
+cachetools     # Caching library for performance
+pandas         # DataFrame operations (already installed)

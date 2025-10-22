@@ -12,7 +12,6 @@ logger = structlog.get_logger(__name__)
 
 ai_router = APIRouter()
 ai_agent = WhatsAppAIAgent()
-
 # Pydantic models
 class TestMessageRequest(BaseModel):
     message: str

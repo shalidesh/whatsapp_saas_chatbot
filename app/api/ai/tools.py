@@ -6,7 +6,10 @@ import structlog
 
 from ...services.vector_service import VectorService
 from ...services.web_search_service import WebSearchService
+from ...services.google_sheets_service import GoogleSheetsService
 from ...utils.sinhala_nlp import SinhalaNLP
+from ...models.google_sheet import GoogleSheetConnection
+from ...config.database import db_session
 
 logger = structlog.get_logger(__name__)
 
@@ -217,7 +220,7 @@ class SinhalaTranslationTool(BaseTool):
 
 class BusinessInfoTool(BaseTool):
     """Tool for getting basic business information"""
-    
+
     name: str = Field(default="get_business_info")
     description: str = Field(default="""
     Get basic information about the business like name, description, contact details.
@@ -226,14 +229,14 @@ class BusinessInfoTool(BaseTool):
     - Contact information
     - Location
     - General business description
-    
+
     No input required.
     """)
     business_context: Dict[str, Any] = Field(description="Business context information")
-    
+
     def __init__(self, business_context: Dict[str, Any], **kwargs):
         super().__init__(business_context=business_context, **kwargs)
-    
+
     def _run(
         self,
         query: str = "",
@@ -242,30 +245,109 @@ class BusinessInfoTool(BaseTool):
         """Get business information"""
         try:
             info_parts = []
-            
+
             if self.business_context.get('name'):
                 info_parts.append(f"Business Name: {self.business_context['name']}")
-            
+
             if self.business_context.get('description'):
                 info_parts.append(f"Description: {self.business_context['description']}")
-            
+
             if self.business_context.get('website_url'):
                 info_parts.append(f"Website: {self.business_context['website_url']}")
-            
+
             if self.business_context.get('whatsapp_phone_number'):
                 info_parts.append(f"WhatsApp: {self.business_context['whatsapp_phone_number']}")
-            
+
             if self.business_context.get('business_category'):
                 info_parts.append(f"Category: {self.business_context['business_category']}")
-            
+
             if info_parts:
                 return "Business Information:\n" + "\n".join(info_parts)
             else:
                 return "Business information is not available."
-                
+
         except Exception as e:
             logger.error("Error getting business info", error=str(e))
             return "Error retrieving business information."
+
+class GoogleSheetsQueryTool(BaseTool):
+    """Tool for querying connected Google Sheets in real-time"""
+
+    name: str = Field(default="query_google_sheets")
+    description: str = Field(default="""
+    Search and query live Google Sheets data. Use this when users ask about:
+    - Product inventory or stock levels
+    - Pricing information that updates frequently
+    - Customer data or contact lists
+    - Real-time data from spreadsheets
+    - Any information stored in connected Google Sheets
+
+    This tool fetches fresh data from Google Sheets, so it always returns up-to-date information.
+    Input should be the user's query in natural language.
+    """)
+    business_id: int = Field(description="Business ID for Google Sheets access")
+
+    def __init__(self, business_id: int, **kwargs):
+        super().__init__(business_id=business_id, **kwargs)
+        self.sheets_service = GoogleSheetsService()
+
+    def _run(
+        self,
+        query: str,
+        run_manager: Optional[CallbackManagerForToolRun] = None,
+    ) -> str:
+        """Query Google Sheets for relevant information"""
+        try:
+            # Get all active sheet connections for this business
+            connections = db_session.query(GoogleSheetConnection).filter(
+                GoogleSheetConnection.business_id == self.business_id,
+                GoogleSheetConnection.is_active == True
+            ).all()
+
+            if not connections:
+                return "No Google Sheets are connected to this business. Please connect a Google Sheet first."
+
+            # Query each connected sheet
+            all_results = []
+            for connection in connections:
+                import asyncio
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    result = loop.run_until_complete(
+                        self.sheets_service.query_sheet(
+                            business_id=self.business_id,
+                            sheet_connection_id=connection.id,
+                            query=query,
+                            max_results=3
+                        )
+                    )
+                finally:
+                    loop.close()
+
+                if result.get('success') and result.get('rows'):
+                    all_results.append({
+                        'sheet_name': connection.name,
+                        'rows': result['rows']
+                    })
+
+            if not all_results:
+                return "No relevant information found in connected Google Sheets."
+
+            # Format results
+            formatted_results = []
+            for sheet_result in all_results:
+                sheet_name = sheet_result['sheet_name']
+                formatted_results.append(f"\nFrom '{sheet_name}':")
+                for i, row in enumerate(sheet_result['rows'], 1):
+                    row_text = ', '.join(f"{k}: {v}" for k, v in row.items() if v is not None)
+                    formatted_results.append(f"{i}. {row_text}")
+
+            return "Google Sheets data (live, up-to-date):\n" + "\n".join(formatted_results)
+
+        except Exception as e:
+            logger.error("Error querying Google Sheets", error=str(e))
+            return "Error accessing Google Sheets. Please try again."
 
 # Simplified tool functions (alternative approach)
 async def search_business_documents_simple(query: str, business_id: int) -> str:
@@ -326,37 +408,86 @@ def get_business_info_simple(business_context: Dict[str, Any]) -> str:
     """Simple function to get business info"""
     try:
         info_parts = []
-        
+
         if business_context.get('name'):
             info_parts.append(f"Business Name: {business_context['name']}")
-        
+
         if business_context.get('description'):
             info_parts.append(f"Description: {business_context['description']}")
-        
+
         if business_context.get('website_url'):
             info_parts.append(f"Website: {business_context['website_url']}")
-        
+
         if business_context.get('whatsapp_phone_number'):
             info_parts.append(f"WhatsApp: {business_context['whatsapp_phone_number']}")
-        
+
         if business_context.get('business_category'):
             info_parts.append(f"Category: {business_context['business_category']}")
-        
+
         if info_parts:
             return "Business Information:\n" + "\n".join(info_parts)
         else:
             return "Business information is not available."
-            
+
     except Exception as e:
         logger.error("Error getting business info", error=str(e))
         return "Error retrieving business information."
 
+async def query_google_sheets_simple(query: str, business_id: int) -> str:
+    """Simple function to query Google Sheets"""
+    try:
+        sheets_service = GoogleSheetsService()
+
+        # Get all active sheet connections
+        connections = db_session.query(GoogleSheetConnection).filter(
+            GoogleSheetConnection.business_id == business_id,
+            GoogleSheetConnection.is_active == True
+        ).all()
+
+        if not connections:
+            return "No Google Sheets are connected to this business."
+
+        # Query each sheet
+        all_results = []
+        for connection in connections:
+            result = await sheets_service.query_sheet(
+                business_id=business_id,
+                sheet_connection_id=connection.id,
+                query=query,
+                max_results=3
+            )
+
+            if result.get('success') and result.get('rows'):
+                all_results.append({
+                    'sheet_name': connection.name,
+                    'rows': result['rows']
+                })
+
+        if not all_results:
+            return "No relevant information found in connected Google Sheets."
+
+        # Format results
+        formatted_results = []
+        for sheet_result in all_results:
+            sheet_name = sheet_result['sheet_name']
+            formatted_results.append(f"\nFrom '{sheet_name}':")
+            for i, row in enumerate(sheet_result['rows'], 1):
+                row_text = ', '.join(f"{k}: {v}" for k, v in row.items() if v is not None)
+                formatted_results.append(f"{i}. {row_text}")
+
+        return "Google Sheets data (live):\n" + "\n".join(formatted_results)
+
+    except Exception as e:
+        logger.error("Error querying Google Sheets", error=str(e))
+        return "Error accessing Google Sheets. Please try again."
+
 def get_ai_tools(business_id: int, business_context: Dict[str, Any]) -> List[BaseTool]:
     """Get list of available AI tools for a business"""
-    
+
     try:
         tools = [
             BusinessDocumentSearchTool(business_id=business_id),
+            GoogleSheetsQueryTool(business_id=business_id),
             WebSearchTool(),
             SinhalaTranslationTool(),
             BusinessInfoTool(business_context=business_context)
@@ -369,9 +500,10 @@ def get_ai_tools(business_id: int, business_context: Dict[str, Any]) -> List[Bas
 
 def get_tool_descriptions() -> Dict[str, str]:
     """Get descriptions of all available tools"""
-    
+
     return {
         "search_business_documents": "Search uploaded business documents and data",
+        "query_google_sheets": "Query live Google Sheets data (always up-to-date)",
         "web_search": "Search the web for current information",
         "translate_to_sinhala": "Translate English text to Sinhala",
         "get_business_info": "Get basic business information"
@@ -379,10 +511,11 @@ def get_tool_descriptions() -> Dict[str, str]:
 
 # Export simple functions for direct use
 __all__ = [
-    'get_ai_tools', 
+    'get_ai_tools',
     'get_tool_descriptions',
     'search_business_documents_simple',
-    'web_search_simple', 
+    'query_google_sheets_simple',
+    'web_search_simple',
     'translate_to_sinhala_simple',
     'get_business_info_simple'
 ]

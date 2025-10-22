@@ -9,9 +9,11 @@ from ...models.user import User
 from ...models.business import Business
 from ...models.message import Message, MessageDirection, MessageStatus
 from ...models.document import Document, DocumentStatus
+from ...models.google_sheet import GoogleSheetConnection
 from ...config.database import db_session
 from ...middleware.auth import get_current_user
 from ...services.document_service import DocumentService
+from ...services.google_sheets_service import GoogleSheetsService
 from ...tasks.document_processing import process_document_upload
 from .analytics import AnalyticsService
 
@@ -19,6 +21,7 @@ logger = structlog.get_logger(__name__)
 
 dashboard_router = APIRouter()
 analytics_service = AnalyticsService()
+google_sheets_service = GoogleSheetsService()
 
 # Pydantic models
 class BusinessSettingsUpdate(BaseModel):
@@ -556,4 +559,359 @@ async def get_comprehensive_analytics(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to get comprehensive analytics"
+        )
+
+# Google Sheets Integration Routes
+
+class GoogleSheetConnectionRequest(BaseModel):
+    business_id: int
+    name: str
+    sheet_url: str
+    cache_ttl_minutes: Optional[int] = 10
+
+class GoogleSheetConnectionResponse(BaseModel):
+    message: str
+    connection: dict
+
+class GoogleSheetsListResponse(BaseModel):
+    connections: List[dict]
+
+class GoogleSheetQueryRequest(BaseModel):
+    business_id: int
+    sheet_connection_id: int
+    query: str
+    max_results: Optional[int] = 5
+
+class GoogleSheetQueryResponse(BaseModel):
+    success: bool
+    message: str
+    rows: List[dict]
+    total_rows: Optional[int] = None
+    columns: Optional[List[str]] = None
+
+@dashboard_router.post("/google-sheets/test-connection")
+async def test_google_sheet_connection(
+    sheet_url: str = Form(...),
+    current_user: User = Depends(get_current_user)
+):
+    """Test Google Sheets connection before saving"""
+    try:
+        result = await google_sheets_service.test_connection(sheet_url)
+        return result
+
+    except Exception as e:
+        logger.error("Error testing Google Sheets connection", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to test connection: {str(e)}"
+        )
+
+@dashboard_router.post("/google-sheets/connect", response_model=GoogleSheetConnectionResponse)
+async def connect_google_sheet(
+    request: GoogleSheetConnectionRequest,
+    current_user: User = Depends(get_current_user)
+):
+    """Connect a Google Sheet to the business"""
+    try:
+        # Verify business ownership
+        business = db_session.query(Business).filter(
+            Business.id == request.business_id,
+            Business.user_id == current_user.id
+        ).first()
+
+        if not business:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Business not found"
+            )
+
+        # Extract sheet ID from URL
+        sheet_id = google_sheets_service.extract_sheet_id(request.sheet_url)
+        if not sheet_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid Google Sheets URL"
+            )
+
+        # Test connection first
+        test_result = await google_sheets_service.test_connection(request.sheet_url)
+        if not test_result.get('success'):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=test_result.get('message', 'Failed to connect to Google Sheet')
+            )
+
+        # Check if already connected
+        existing = db_session.query(GoogleSheetConnection).filter(
+            GoogleSheetConnection.business_id == request.business_id,
+            GoogleSheetConnection.sheet_id == sheet_id,
+            GoogleSheetConnection.is_active == True
+        ).first()
+
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This Google Sheet is already connected"
+            )
+
+        # Create connection
+        connection = GoogleSheetConnection(
+            business_id=request.business_id,
+            name=request.name,
+            sheet_url=request.sheet_url,
+            sheet_id=sheet_id,
+            cache_ttl_minutes=request.cache_ttl_minutes,
+            row_count=test_result.get('row_count', 0),
+            column_count=test_result.get('column_count', 0),
+            last_synced_at=datetime.utcnow()
+        )
+
+        db_session.add(connection)
+        db_session.commit()
+
+        logger.info("Google Sheet connected",
+                   connection_id=connection.id,
+                   business_id=request.business_id)
+
+        return GoogleSheetConnectionResponse(
+            message="Google Sheet connected successfully",
+            connection=connection.to_dict()
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Error connecting Google Sheet", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to connect Google Sheet"
+        )
+
+@dashboard_router.get("/google-sheets", response_model=GoogleSheetsListResponse)
+async def get_google_sheets(
+    business_id: int = Query(..., description="Business ID"),
+    current_user: User = Depends(get_current_user)
+):
+    """Get all Google Sheets connected to a business"""
+    try:
+        # Verify business ownership
+        business = db_session.query(Business).filter(
+            Business.id == business_id,
+            Business.user_id == current_user.id
+        ).first()
+
+        if not business:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Business not found"
+            )
+
+        connections = db_session.query(GoogleSheetConnection).filter(
+            GoogleSheetConnection.business_id == business_id,
+            GoogleSheetConnection.is_active == True
+        ).order_by(desc(GoogleSheetConnection.created_at)).all()
+
+        return GoogleSheetsListResponse(
+            connections=[conn.to_dict() for conn in connections]
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Error getting Google Sheets", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to get Google Sheets"
+        )
+
+@dashboard_router.post("/google-sheets/query", response_model=GoogleSheetQueryResponse)
+async def query_google_sheet(
+    request: GoogleSheetQueryRequest,
+    current_user: User = Depends(get_current_user)
+):
+    """Query a connected Google Sheet"""
+    try:
+        # Verify business ownership
+        business = db_session.query(Business).filter(
+            Business.id == request.business_id,
+            Business.user_id == current_user.id
+        ).first()
+
+        if not business:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Business not found"
+            )
+
+        # Query the sheet
+        result = await google_sheets_service.query_sheet(
+            business_id=request.business_id,
+            sheet_connection_id=request.sheet_connection_id,
+            query=request.query,
+            max_results=request.max_results
+        )
+
+        return GoogleSheetQueryResponse(**result)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Error querying Google Sheet", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to query Google Sheet"
+        )
+
+@dashboard_router.get("/google-sheets/{connection_id}/preview")
+async def get_google_sheet_preview(
+    connection_id: int,
+    business_id: int = Query(..., description="Business ID"),
+    num_rows: int = Query(5, ge=1, le=20, description="Number of rows to preview"),
+    current_user: User = Depends(get_current_user)
+):
+    """Get a preview of Google Sheet data"""
+    try:
+        # Verify business ownership
+        business = db_session.query(Business).filter(
+            Business.id == business_id,
+            Business.user_id == current_user.id
+        ).first()
+
+        if not business:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Business not found"
+            )
+
+        result = await google_sheets_service.get_sheet_preview(
+            business_id=business_id,
+            sheet_connection_id=connection_id,
+            num_rows=num_rows
+        )
+
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Error getting Google Sheet preview", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to get preview"
+        )
+
+@dashboard_router.delete("/google-sheets/{connection_id}")
+async def disconnect_google_sheet(
+    connection_id: int,
+    business_id: int = Query(..., description="Business ID"),
+    current_user: User = Depends(get_current_user)
+):
+    """Disconnect a Google Sheet"""
+    try:
+        # Verify business ownership
+        business = db_session.query(Business).filter(
+            Business.id == business_id,
+            Business.user_id == current_user.id
+        ).first()
+
+        if not business:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Business not found"
+            )
+
+        connection = db_session.query(GoogleSheetConnection).filter(
+            GoogleSheetConnection.id == connection_id,
+            GoogleSheetConnection.business_id == business_id
+        ).first()
+
+        if not connection:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Connection not found"
+            )
+
+        # Mark as inactive
+        connection.is_active = False
+        db_session.commit()
+
+        # Clear cache for this sheet
+        google_sheets_service.clear_cache(connection.sheet_id)
+
+        logger.info("Google Sheet disconnected", connection_id=connection_id)
+
+        return {"message": "Google Sheet disconnected successfully"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Error disconnecting Google Sheet", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to disconnect Google Sheet"
+        )
+
+@dashboard_router.post("/google-sheets/{connection_id}/refresh-cache")
+async def refresh_google_sheet_cache(
+    connection_id: int,
+    business_id: int = Query(..., description="Business ID"),
+    current_user: User = Depends(get_current_user)
+):
+    """Force refresh the cache for a Google Sheet"""
+    try:
+        # Verify business ownership
+        business = db_session.query(Business).filter(
+            Business.id == business_id,
+            Business.user_id == current_user.id
+        ).first()
+
+        if not business:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Business not found"
+            )
+
+        connection = db_session.query(GoogleSheetConnection).filter(
+            GoogleSheetConnection.id == connection_id,
+            GoogleSheetConnection.business_id == business_id,
+            GoogleSheetConnection.is_active == True
+        ).first()
+
+        if not connection:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Connection not found"
+            )
+
+        # Clear cache and fetch fresh data
+        google_sheets_service.clear_cache(connection.sheet_id)
+        df = await google_sheets_service.fetch_sheet_data(
+            sheet_id=connection.sheet_id,
+            use_cache=False
+        )
+
+        if df is not None:
+            connection.last_synced_at = datetime.utcnow()
+            connection.row_count = len(df)
+            connection.column_count = len(df.columns)
+            db_session.commit()
+
+            return {
+                "message": "Cache refreshed successfully",
+                "row_count": len(df),
+                "column_count": len(df.columns)
+            }
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to fetch sheet data"
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Error refreshing cache", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to refresh cache"
         )
