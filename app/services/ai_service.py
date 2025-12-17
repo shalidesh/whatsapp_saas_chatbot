@@ -15,6 +15,7 @@ import numpy as np
 
 from ..services.vector_service import VectorService, HuggingFaceEmbeddings
 from ..services.web_search_service import WebSearchService
+from ..services.google_sheets_service import GoogleSheetsService
 from ..utils.sinhala_nlp import SinhalaNLP
 from ..config.settings import config
 
@@ -32,6 +33,7 @@ class AIAgentState(TypedDict):
     messages: List[Any]
     business_context: Dict[str, Any]
     search_results: List[Dict[str, Any]]
+    google_sheets_results: List[Dict[str, Any]]
     web_search_results: List[Dict[str, Any]]
     final_response: str
     language: str
@@ -59,6 +61,7 @@ class WhatsAppAIAgent:
         self.embedding_dimension = 384  # Standard dimension for MiniLM models
         self.vector_service = VectorService()
         self.web_search_service = WebSearchService()
+        self.google_sheets_service = GoogleSheetsService()
         self.sinhala_nlp = SinhalaNLP()
         
         # Initialize LangSmith if API key is provided
@@ -85,35 +88,49 @@ class WhatsAppAIAgent:
     
     def _create_agent_graph(self) -> StateGraph:
         """Create the LangGraph workflow for the AI agent"""
-        
+
         # Create workflow graph with TypedDict state
         workflow = StateGraph(AIAgentState)
-        
+
         # Add nodes
         workflow.add_node("analyze_query", self._analyze_query)
         workflow.add_node("search_internal", self._search_internal_data)
+        workflow.add_node("search_google_sheets", self._search_google_sheets_data)
         workflow.add_node("search_web", self._search_web_data)
         workflow.add_node("generate_response", self._generate_response)
         workflow.add_node("translate_response", self._translate_response)
-        
+
         # Set entry point
         workflow.set_entry_point("analyze_query")
-        
+
         # Add edges
         workflow.add_edge("analyze_query", "search_internal")
-        
-        # Add conditional edges
+
+        # NEW ROUTING LOGIC:
+        # 1. After vector DB search, check if results are useful
         workflow.add_conditional_edges(
             "search_internal",
-            self._should_search_web,
+            self._route_after_vector_search,
             {
-                "search_web": "search_web",
-                "generate": "generate_response"
+                "generate": "generate_response",  # If vector DB has useful results
+                "google_sheets": "search_google_sheets"  # If vector DB empty/weak
             }
         )
-        
+
+        # 2. After Google Sheets search, check if results are useful
+        workflow.add_conditional_edges(
+            "search_google_sheets",
+            self._route_after_google_sheets,
+            {
+                "generate": "generate_response",  # If Google Sheets has results
+                "web_search": "search_web"  # If Google Sheets empty
+            }
+        )
+
+        # 3. After web search, always generate response
         workflow.add_edge("search_web", "generate_response")
-        
+
+        # 4. After response generation, check if translation needed
         workflow.add_conditional_edges(
             "generate_response",
             self._should_translate,
@@ -122,9 +139,9 @@ class WhatsAppAIAgent:
                 "end": END
             }
         )
-        
+
         workflow.add_edge("translate_response", END)
-        
+
         return workflow.compile()
     
     async def process_message(self, message: str, business_id: int, sender_phone: str) -> Dict[str, Any]:
@@ -142,6 +159,7 @@ class WhatsAppAIAgent:
                 "messages": [HumanMessage(content=message)],
                 "business_context": await self._get_business_context(business_id),
                 "search_results": [],
+                "google_sheets_results": [],
                 "web_search_results": [],
                 "final_response": "",
                 "language": detected_language,
@@ -246,18 +264,71 @@ class WhatsAppAIAgent:
             "search_results": search_results
         }
     
+    async def _search_google_sheets_data(self, state: AIAgentState) -> AIAgentState:
+        """Search Google Sheets for business data"""
+        user_query = state["messages"][-1].content
+        business_id = state["business_context"].get('id')
+
+        try:
+            # Get active Google Sheets connections for this business
+            from ..models.google_sheet import GoogleSheetConnection
+            from ..config.database import db_session
+
+            active_sheets = db_session.query(GoogleSheetConnection).filter(
+                GoogleSheetConnection.business_id == business_id,
+                GoogleSheetConnection.is_active == True
+            ).all()
+
+            google_sheets_results = []
+
+            # Search through all active sheets
+            for sheet_connection in active_sheets:
+                try:
+                    result = await self.google_sheets_service.query_sheet(
+                        business_id=business_id,
+                        sheet_connection_id=sheet_connection.id,
+                        query=user_query,
+                        max_results=5
+                    )
+
+                    if result.get('success') and result.get('rows'):
+                        google_sheets_results.extend([
+                            {
+                                'sheet_name': sheet_connection.name,
+                                'data': row,
+                                'source': 'google_sheets'
+                            }
+                            for row in result['rows']
+                        ])
+
+                except Exception as e:
+                    logger.error(f"Error searching sheet {sheet_connection.id}", error=str(e))
+                    continue
+
+            logger.info("Google Sheets search completed", results_count=len(google_sheets_results))
+
+        except Exception as e:
+            logger.error("Error searching Google Sheets", error=str(e))
+            google_sheets_results = []
+
+        # Return updated state dictionary
+        return {
+            **state,
+            "google_sheets_results": google_sheets_results
+        }
+
     async def _search_web_data(self, state: AIAgentState) -> AIAgentState:
         """Search web for additional information"""
         user_query = state["messages"][-1].content
-        
+
         try:
             web_results = await self.web_search_service.search(user_query)
             logger.info("Web search completed", results_count=len(web_results))
-            
+
         except Exception as e:
             logger.error("Error searching web", error=str(e))
             web_results = []
-        
+
         # Return updated state dictionary
         return {
             **state,
@@ -268,26 +339,36 @@ class WhatsAppAIAgent:
 
         if not self.github_client:
                 raise Exception("GitHub AI client not available")
-    
+
         """Generate final response using LLM"""
         user_query = state["messages"][-1].content
         business_context = state["business_context"]
         internal_results = state["search_results"]
+        google_sheets_results = state.get("google_sheets_results", [])
         web_results = state.get("web_search_results", [])
-        
+
         # Prepare context
         context_parts = []
-        
+
         if internal_results:
-            context_parts.append("Business Information:")
+            context_parts.append("Business Documents Information:")
             for result in internal_results[:3]:  # Top 3 results
                 context_parts.append(f"- {result.get('content', '')[:200]}...")
-        
+
+        if google_sheets_results:
+            context_parts.append("\nProduct/Inventory Information from Google Sheets:")
+            for result in google_sheets_results[:5]:  # Top 5 results
+                sheet_name = result.get('sheet_name', 'Unknown Sheet')
+                data = result.get('data', {})
+                # Format the data nicely
+                data_str = ", ".join([f"{k}: {v}" for k, v in data.items() if v is not None])
+                context_parts.append(f"- [{sheet_name}] {data_str}")
+
         if web_results:
-            context_parts.append("Additional Information:")
+            context_parts.append("\nAdditional Web Information:")
             for result in web_results[:2]:  # Top 2 results
                 context_parts.append(f"- {result.get('snippet', '')[:200]}...")
-        
+
         context = "\n".join(context_parts)
         
         # Generate response
@@ -323,7 +404,7 @@ class WhatsAppAIAgent:
                 model=self.model
             )
             final_response = response.choices[0].message.content
-            confidence = 85 if (internal_results or web_results) else 60
+            confidence = 85 if (internal_results or google_sheets_results or web_results) else 60
             
         except Exception as e:
             logger.error("Error generating response", error=str(e))
@@ -354,22 +435,39 @@ class WhatsAppAIAgent:
             "final_response": final_response
         }
     
-    def _should_search_web(self, state: AIAgentState) -> str:
-        """Determine if web search is needed"""
+    def _route_after_vector_search(self, state: AIAgentState) -> str:
+        """
+        Routing logic after vector DB search.
+        If vector DB has useful results → go to generate_response
+        If vector DB is empty or weak → go to Google Sheets
+        """
         internal_results = state["search_results"]
-        
-        # If we have good internal results, skip web search
+
+        # If we have good internal results (>= 2 results), generate response
         if internal_results and len(internal_results) >= 2:
+            logger.info("Vector DB has useful results, proceeding to generate response")
             return "generate"
-        
-        # If query seems to need current/external info, search web
-        query_lower = state["messages"][-1].content.lower()
-        web_indicators = ['latest', 'current', 'news', 'price', 'today', 'recent']
-        
-        if any(indicator in query_lower for indicator in web_indicators):
-            return "search_web"
-        
-        return "generate"
+
+        # If internal results are weak or empty, try Google Sheets
+        logger.info("Vector DB results weak/empty, proceeding to Google Sheets search")
+        return "google_sheets"
+
+    def _route_after_google_sheets(self, state: AIAgentState) -> str:
+        """
+        Routing logic after Google Sheets search.
+        If Google Sheets has useful results → go to generate_response
+        If Google Sheets is empty → go to web search
+        """
+        google_sheets_results = state["google_sheets_results"]
+
+        # If we have Google Sheets results, generate response
+        if google_sheets_results and len(google_sheets_results) > 0:
+            logger.info("Google Sheets has useful results, proceeding to generate response")
+            return "generate"
+
+        # If Google Sheets is also empty, try web search as fallback
+        logger.info("Google Sheets results empty, proceeding to web search")
+        return "web_search"
     
     def _should_translate(self, state: AIAgentState) -> str:
         """Determine if translation is needed"""
